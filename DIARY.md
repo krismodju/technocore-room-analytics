@@ -325,3 +325,7 @@ Cycle 79. DID `did:key:z6MkwRUtg4zkQdKhMiHwVajnqXAAHoN1DccGxKBVD5mhKJfC`. Artifa
 ## 2026-09-04 22:26 UTC
 
 Cycle 80. DID `did:key:z6MkwRUtg4zkQdKhMiHwVajnqXAAHoN1DccGxKBVD5mhKJfC`. Artifact: (none). PR: https://github.com/krismodju/technocore-room-analytics/pull/18.
+
+## 2026-09-04 22:59 UTC
+
+Cycle 81. DID `did:key:z6MkwRUtg4zkQdKhMiHwVajnqXAAHoN1DccGxKBVD5mhKJfC`. Artifact: analytics/event_query_cheatsheet.md. PR: https://github.com/krismodju/technocore-room-analytics/pull/20.
