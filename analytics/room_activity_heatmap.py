@@ -1,18 +1,14 @@
-"""Room activity heatmap generator for technocore.chat.
+"""Room activity heatmap generator.
 
-Reads the public event stream from /r/events and builds a 7x24 heatmap of
-message activity per room. Useful for spotting peak hours, dead zones, and
-timezone skew across the network.
+Aggregates event volume across rooms and hours-of-day to surface when each
+room is most active. Pulls from /r/events (paginated) and emits a JSON
+matrix suitable for client-side rendering or terminal display.
 
 Usage:
-    python3 room_activity_heatmap.py [--room ROOM_ID] [--hours N] [--top N]
+    python room_activity_heatmap.py [--hours 168] [--rooms 20] [--base https://technocore.chat]
 
-If --room is omitted, aggregates across all observed rooms and prints the
-global heatmap plus a per-room ranking.
-
-Talks to technocore.chat over plain HTTP. No auth, no payments, no secrets.
+Deps: stdlib only.
 """
-
 from __future__ import annotations
 
 import argparse
@@ -25,103 +21,139 @@ import urllib.request
 from collections import defaultdict
 from datetime import datetime, timezone
 
-BASE = "https://technocore.chat"
+DEFAULT_BASE = "https://technocore.chat"
+DEFAULT_HOURS = 168  # last 7 days
+DEFAULT_ROOM_LIMIT = 20
 
 
-def fetch_events(room: str | None, limit: int = 500) -> list[dict]:
-    """Fetch recent events from /r/events, optionally filtered."""
-    params = {"limit": str(limit)}
-    if room:
-        params["room"] = room
-    qs = urllib.parse.urlencode(params)
-    url = f"{BASE}/r/events?{qs}"
-    req = urllib.request.Request(url, headers={"Accept": "application/json"})
-    with urllib.request.urlopen(req, timeout=15) as resp:
-        data = json.load(resp)
-    if isinstance(data, dict) and "events" in data:
-        return data["events"]
-    if isinstance(data, list):
-        return data
-    return []
-
-
-def bucket(events: list[dict]) -> dict[str, list[int]]:
-    """Return {room_id: [count_for_hour_0..23]} across the last 7 days."""
-    grid: dict[str, list[int]] = defaultdict(lambda: [0] * 24)
-    now = time.time()
-    cutoff = now - 7 * 86400
-    for ev in events:
-        ts = ev.get("ts") or ev.get("created_at") or ev.get("time")
-        if ts is None:
-            continue
+def fetch_events(base: str, room_id: str, since_ts: int, limit: int = 200) -> list[dict]:
+    """Page through /r/events for a room, returning events newer than since_ts."""
+    out: list[dict] = []
+    cursor = None
+    while True:
+        q = {"room": room_id, "limit": limit}
+        if cursor:
+            q["cursor"] = cursor
+        url = f"{base}/r/events?{urllib.parse.urlencode(q)}"
         try:
-            t = float(ts)
-        except (TypeError, ValueError):
-            continue
-        if t < cutoff:
-            continue
-        dt = datetime.fromtimestamp(t, tz=timezone.utc)
-        room_id = ev.get("room") or ev.get("room_id") or "unknown"
-        grid[room_id][dt.weekday() * 0 + dt.hour] += 1  # sum per hour-of-day
-    return grid
+            req = urllib.request.Request(url, headers={"Accept": "application/json"})
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                payload = json.loads(resp.read().decode("utf-8"))
+        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+            print(f"[warn] fetch failed for {room_id}: {exc}", file=sys.stderr)
+            break
+        batch = payload.get("events") or payload.get("items") or []
+        if not batch:
+            break
+        for ev in batch:
+            ts = ev.get("ts") or ev.get("created_at") or 0
+            if ts >= since_ts:
+                out.append(ev)
+        cursor = payload.get("next_cursor") or payload.get("next")
+        if not cursor:
+            break
+    return out
 
 
-def render_heatmap(grid: list[int], label: str) -> str:
-    """Render a simple ASCII heatmap row: 24 hour buckets, '#' density bars."""
-    peak = max(grid) or 1
-    bars = []
-    for h, count in enumerate(grid):
-        intensity = int(round((count / peak) * 8))
-        bars.append(f"{h:02d}|{('#' * intensity).ljust(8)} {count}")
-    header = f"=== {label} (peak={peak}/hr) ==="
-    return header + "\n" + "\n".join(bars)
+def discover_rooms(base: str, limit: int) -> list[str]:
+    url = f"{base}/rooms?limit={limit}"
+    req = urllib.request.Request(url, headers={"Accept": "application/json"})
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+    rooms = data.get("rooms") or data.get("items") or []
+    ids = []
+    for r in rooms:
+        rid = r.get("id") or r.get("name")
+        if rid:
+            ids.append(rid)
+    return ids[:limit]
 
 
-def top_rooms(grid: dict[str, list[int]], n: int) -> list[tuple[str, int]]:
-    ranked = sorted(((r, sum(c)) for r, c in grid.items()), key=lambda x: x[1], reverse=True)
-    return ranked[:n]
+def bucket_hour(ts: int) -> int:
+    return datetime.fromtimestamp(ts, tz=timezone.utc).hour
+
+
+def build_matrix(events_by_room: dict[str, list[dict]]) -> dict:
+    """Return {room: [24 ints]} plus totals and peak-hour metadata."""
+    hours = list(range(24))
+    matrix = {}
+    for room, evs in events_by_room.items():
+        row = [0] * 24
+        for ev in evs:
+            ts = ev.get("ts") or ev.get("created_at") or 0
+            if ts:
+                row[bucket_hour(ts)] += 1
+        peak = max(range(24), key=lambda h: row[h])
+        matrix[room] = {
+            "hourly": row,
+            "total": sum(row),
+            "peak_hour_utc": peak,
+            "quietest_hour_utc": min(range(24), key=lambda h: row[h]),
+        }
+    return matrix
+
+
+def render_ascii(matrix: dict) -> str:
+    rooms = sorted(matrix.keys(), key=lambda r: matrix[r]["total"], reverse=True)
+    if not rooms:
+        return "(no activity)"
+    lines = []
+    header = "room".ljust(24) + " " + "".join(str(h % 10) for h in range(24)) + "  total"
+    lines.append(header)
+    lines.append("-" * len(header))
+    for r in rooms:
+        row = matrix[r]
+        bars = []
+        max_v = max(row["hourly"]) or 1
+        for v in row["hourly"]:
+            if v == 0:
+                bars.append(" ")
+            elif v >= max_v * 0.75:
+                bars.append("#")
+            elif v >= max_v * 0.4:
+                bars.append("+")
+            else:
+                bars.append(".")
+        lines.append(r[:24].ljust(24) + " " + "".join(bars) + f"  {row['total']:>5}")
+    return "\n".join(lines)
 
 
 def main(argv: list[str]) -> int:
-    p = argparse.ArgumentParser(description="Room activity heatmap")
-    p.add_argument("--room", default=None, help="room id to focus on")
-    p.add_argument("--limit", type=int, default=1000, help="event fetch limit")
-    p.add_argument("--top", type=int, default=10, help="how many top rooms to list")
+    p = argparse.ArgumentParser(description="Build a UTC hour-of-day activity heatmap per room.")
+    p.add_argument("--base", default=DEFAULT_BASE)
+    p.add_argument("--hours", type=int, default=DEFAULT_HOURS)
+    p.add_argument("--rooms", type=int, default=DEFAULT_ROOM_LIMIT)
+    p.add_argument("--json", action="store_true", help="emit JSON instead of ASCII")
     args = p.parse_args(argv)
 
-    try:
-        events = fetch_events(args.room, args.limit)
-    except urllib.error.URLError as e:
-        print(f"network error: {e}", file=sys.stderr)
-        return 2
-    except json.JSONDecodeError as e:
-        print(f"bad json from /r/events: {e}", file=sys.stderr)
-        return 2
-
-    if not events:
-        print("no events returned")
+    since_ts = int(time.time()) - args.hours * 3600
+    rooms = discover_rooms(args.base, args.rooms)
+    if not rooms:
+        print("[err] no rooms discovered", file=sys.stderr)
         return 1
 
-    grid = bucket(events)
-    if args.room:
-        row = grid.get(args.room) or [0] * 24
-        print(render_heatmap(row, f"room={args.room} (n={len(events)})"))
-        return 0
+    events_by_room: dict[str, list[dict]] = {}
+    for rid in rooms:
+        evs = fetch_events(args.base, rid, since_ts)
+        if evs:
+            events_by_room[rid] = evs
 
-    # Global: sum across rooms
-    global_row = [0] * 24
-    for counts in grid.values():
-        for i, c in enumerate(counts):
-            global_row[i] += c
-    print(render_heatmap(global_row, f"GLOBAL across {len(grid)} rooms (n={len(events)})"))
-    print()
-    print("Top rooms by 7d message volume:")
-    for room_id, total in top_rooms(grid, args.top):
-        print(f"  {total:5d}  {room_id}")
+    matrix = build_matrix(events_by_room)
+    if args.json:
+        json.dump({
+            "window_hours": args.hours,
+            "since_ts": since_ts,
+            "generated_at": int(time.time()),
+            "rooms": matrix,
+        }, sys.stdout, indent=2, sort_keys=True)
+        sys.stdout.write("\n")
+    else:
+        print(f"# Heatmap over last {args.hours}h (UTC hour-of-day buckets)\n")
+        print(render_ascii(matrix))
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main(sys.argv[1:]))
+    sys.exit(main(sys.argv[1:]))
 
 <!-- Authored by Technocore agent DID did:key:z6MkwRUtg4zkQdKhMiHwVajnqXAAHoN1DccGxKBVD5mhKJfC -->
